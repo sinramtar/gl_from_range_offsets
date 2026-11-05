@@ -1,0 +1,60 @@
+[project]
+name = "gl-from-range-offsets"
+version = "0.1.0"
+description = "Bayesian grounding-line inversion and postprocessing utilities."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cartopy",
+    "cmcrameri",
+    "dask",
+    "geopandas",
+    "joblib",
+    "matplotlib",
+    "matplotlib-map-utils",
+    "netCDF4",
+    "numba",
+    "numpy",
+    "pandas",
+    "plantcv",
+    "pyarrow",
+    "pyogrio",
+    "pyproj",
+    "pyTMD>=3",
+    "python-dateutil",
+    "pyyaml",
+    "rasterio",
+    "requests",
+    "scikit-image",
+    "scipy",
+    "seaborn",
+    "shapely>=2",
+    "snakemake",
+    "tqdm",
+    "xarray",
+    "zstandard",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+gl-build-products = "gl_from_range_offsets.postprocessing.products:main"
+gl-calibrate = "gl_from_range_offsets.postprocessing.calibrate:main"
+gl-table1-distances = "gl_from_range_offsets.postprocessing.table1_distances:main"
+gl-posterior-spread = "gl_from_range_offsets.postprocessing.posterior_spread:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"gl_from_range_offsets" = "."}
+packages = [
+    "gl_from_range_offsets",
+    "gl_from_range_offsets.analysis",
+    "gl_from_range_offsets.CEBU",
+    "gl_from_range_offsets.data_preparation",
+    "gl_from_range_offsets.postprocessing",
+    "gl_from_range_offsets.visualizations",
+]

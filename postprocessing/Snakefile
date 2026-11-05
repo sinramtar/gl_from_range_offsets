@@ -1,0 +1,365 @@
+from pathlib import Path
+import shlex
+import sys
+
+
+configfile: "config.yaml"
+
+
+repo_root = Path(workflow.basedir).parent.resolve()
+repo_parent = repo_root.parent
+python = Path(sys.executable)
+config_path = Path(workflow.configfiles[0]).resolve() if workflow.configfiles else repo_root / "config.yaml"
+
+directories = config["Directories"]
+work_dir = Path(directories["work_dir"]).expanduser().resolve()
+roi = config["Offset_params"]["roi"]
+experiment = f"{directories['expt']}_{directories['flowline_variant']}"
+
+data_dir = work_dir / directories["data_dir"] / roi
+postprocessing_dir = work_dir / directories["save_dir"] / roi / experiment
+inversions_dir = work_dir / directories["processing_dir"] / roi / experiment
+calibration_dir = postprocessing_dir / "calibration"
+figures_dir = work_dir / directories["save_dir"] / roi / "plots" / experiment
+dinsars_dir = data_dir / directories["dinsar_gls_automatic"]
+uncertainty_dir = data_dir / directories["dinsar_uncertainty"]
+uncertainty_polygons = tuple(sorted(uncertainty_dir.glob("*.geojson")))
+flow_bends = data_dir / "hybrid_flowlines.gpkg"
+reference_gl = data_dir / directories["original_tmoc_gl"]
+basemap = work_dir / directories["basemap"]
+radar_mosaic = work_dir / directories.get(
+    "radar_mosaic", Path(directories["data_dir"]) / "RADARSAT_Mosaic.jp2"
+)
+proj_data = directories.get("proj_data")
+workers = int(config["Posterior_params"].get("workers", 8))
+
+points = postprocessing_dir / "paper_points.parquet"
+pair_intervals = postprocessing_dir / "pair_intervals.parquet"
+cumulative_intervals = postprocessing_dir / "cumulative_intervals.parquet"
+truth_cache = calibration_dir / "truth_cache.parquet"
+truth_cache_sidecar = truth_cache.with_suffix(".parquet.json")
+reference_uncertainty = calibration_dir / "reference_uncertainty.parquet"
+reference_uncertainty_audit = calibration_dir / "reference_uncertainty_links.parquet"
+
+pit = calibration_dir / "pit.parquet"
+coverage = calibration_dir / "coverage.parquet"
+distances = postprocessing_dir / "table1_distances_points.parquet"
+posterior_spread = postprocessing_dir / "posterior_spread.json"
+posterior_spread_sidecar = Path(str(posterior_spread) + ".json")
+filtered_map_pdf = figures_dir / "filtered_gl_points.pdf"
+filtered_map_png = figures_dir / "filtered_gl_points.png"
+ci_maps_pdf = figures_dir / "ci_spatial_maps.pdf"
+ci_maps_png = figures_dir / "ci_spatial_maps.png"
+ci_band_pdf = figures_dir / "ci_uncertainty_band.pdf"
+ci_band_png = figures_dir / "ci_uncertainty_band.png"
+ci_widths_pdf = figures_dir / "ci_widths_regplots.pdf"
+ci_widths_png = figures_dir / "ci_widths_regplots.png"
+dinsar_violin_pdf = figures_dir / "dinsar_comp.pdf"
+dinsar_violin_png = figures_dir / "dinsar_comp.png"
+posterior_sum_pdf = figures_dir / "gl_posteriors_sum_1563.pdf"
+posterior_sum_png = figures_dir / "gl_posteriors_sum_1563.png"
+
+
+def quoted(value):
+    return shlex.quote(str(value))
+
+
+def py_command(module, args="", pass_config=True):
+    environment = f"PYTHONPATH={quoted(repo_parent)} MPLCONFIGDIR=/tmp "
+    if proj_data:
+        environment += f"PROJ_DATA={quoted(work_dir / proj_data)} "
+    config_arg = f"--config {quoted(config_path)} " if pass_config else ""
+    return f"{environment}{quoted(python)} -m gl_from_range_offsets.{module} {config_arg}{args}"
+
+
+rule postprocess:
+    input:
+        points,
+        pair_intervals,
+        cumulative_intervals,
+        points.with_suffix(".parquet.json"),
+        pair_intervals.with_suffix(".parquet.json"),
+        cumulative_intervals.with_suffix(".parquet.json"),
+
+
+rule calibration:
+    input:
+        points,
+        pair_intervals,
+        cumulative_intervals,
+        truth_cache,
+        truth_cache_sidecar,
+        reference_uncertainty,
+        reference_uncertainty_audit,
+        reference_uncertainty.with_suffix(".parquet.json"),
+        reference_uncertainty_audit.with_suffix(".parquet.json"),
+        pit,
+        coverage,
+        pit.with_suffix(".parquet.json"),
+        coverage.with_suffix(".parquet.json"),
+        figures_dir / "reliability.pdf",
+        figures_dir / "reliability.png",
+        figures_dir / "reliability_by_group.pdf",
+        figures_dir / "reliability_by_group.png",
+        figures_dir / "reliability_none.pdf",
+        figures_dir / "reliability_none.png",
+        figures_dir / "reliability_source.pdf",
+        figures_dir / "reliability_source.png",
+        figures_dir / "reliability_source_by_group.pdf",
+        figures_dir / "reliability_source_by_group.png",
+
+
+rule paper:
+    input:
+        points,
+        pair_intervals,
+        cumulative_intervals,
+        pit,
+        coverage,
+        distances,
+        distances.with_suffix(".parquet.json"),
+        posterior_spread,
+        posterior_spread_sidecar,
+        filtered_map_pdf,
+        filtered_map_png,
+        ci_maps_pdf,
+        ci_maps_png,
+        ci_band_pdf,
+        ci_band_png,
+        ci_widths_pdf,
+        ci_widths_png,
+        dinsar_violin_pdf,
+        dinsar_violin_png,
+        posterior_sum_pdf,
+        posterior_sum_png,
+
+
+rule build_products:
+    input:
+        flow_bends=flow_bends,
+        inversions_dir=inversions_dir,
+    output:
+        points,
+        pair_intervals,
+        cumulative_intervals,
+        points.with_suffix(".parquet.json"),
+        pair_intervals.with_suffix(".parquet.json"),
+        cumulative_intervals.with_suffix(".parquet.json"),
+    threads:
+        workers
+    shell:
+        py_command(
+            "postprocessing.products",
+            f"--flowlines {quoted(flow_bends)} "
+            f"--inversion-dir {quoted(inversions_dir)} "
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            "--workers {threads}",
+        )
+
+
+rule build_truth_cache:
+    input:
+        flow_bends=flow_bends,
+        reference_gl=reference_gl,
+        dinsars_dir=dinsars_dir,
+        config=config_path,
+    output:
+        truth_cache,
+        truth_cache_sidecar,
+    threads:
+        workers
+    shell:
+        py_command(
+            "postprocessing.calibration_truth",
+            f"--flow-bends {quoted(flow_bends)} "
+            f"--reference-gl {quoted(reference_gl)} "
+            f"--dinsars-dir {quoted(dinsars_dir)} "
+            f"--out {quoted(truth_cache)} "
+            "--threads {threads}",
+        )
+
+
+rule build_reference_uncertainty:
+    input:
+        truth_cache=truth_cache,
+        flow_bends=flow_bends,
+        polygons=uncertainty_polygons,
+        config=config_path,
+    output:
+        reference_uncertainty,
+        reference_uncertainty_audit,
+        reference_uncertainty.with_suffix(".parquet.json"),
+        reference_uncertainty_audit.with_suffix(".parquet.json"),
+    params:
+        manual_sigma=float(config["Calibration"]["manual_reference_sigma_m"]),
+        max_half_width=float(config["Calibration"]["max_reference_half_width_m"]),
+        polygon_args=lambda wildcards, input: " ".join(
+            quoted(path) for path in input.polygons
+        ),
+    shell:
+        py_command(
+            "postprocessing.reference_uncertainty",
+            f"--truth-cache {quoted(truth_cache)} "
+            f"--flow-bends {quoted(flow_bends)} "
+            "--uncertainty-polygons {params.polygon_args} "
+            "--manual-sigma-m {params.manual_sigma} "
+            "--max-half-width-m {params.max_half_width} "
+            f"--out {quoted(reference_uncertainty)} "
+            f"--audit-out {quoted(reference_uncertainty_audit)}",
+            pass_config=False,
+        )
+
+
+rule run_calibration:
+    input:
+        pair_intervals=pair_intervals,
+        truth_cache=truth_cache,
+        reference_uncertainty=reference_uncertainty,
+        config=config_path,
+    output:
+        pit,
+        coverage,
+        pit.with_suffix(".parquet.json"),
+        coverage.with_suffix(".parquet.json"),
+        figures_dir / "reliability.pdf",
+        figures_dir / "reliability.png",
+        figures_dir / "reliability_by_group.pdf",
+        figures_dir / "reliability_by_group.png",
+        figures_dir / "reliability_none.pdf",
+        figures_dir / "reliability_none.png",
+        figures_dir / "reliability_source.pdf",
+        figures_dir / "reliability_source.png",
+        figures_dir / "reliability_source_by_group.pdf",
+        figures_dir / "reliability_source_by_group.png",
+    shell:
+        py_command(
+            "postprocessing.calibrate",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--calibration-dir {quoted(calibration_dir)} "
+            f"--figures-dir {quoted(figures_dir)} "
+            f"--truth-cache {quoted(truth_cache)} "
+            f"--reference-uncertainty {quoted(reference_uncertainty)}",
+        )
+
+
+rule table1_distances:
+    input:
+        points,
+        flow_bends,
+        dinsars_dir,
+        basemap,
+    output:
+        distances,
+        distances.with_suffix(".parquet.json"),
+    shell:
+        py_command(
+            "postprocessing.table1_distances",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--flow-bends {quoted(flow_bends)} "
+            f"--dinsars-dir {quoted(dinsars_dir)} "
+            f"--basemap {quoted(basemap)}",
+        )
+
+
+rule posterior_spread:
+    input:
+        points,
+        pair_intervals,
+        cumulative_intervals,
+        truth_cache,
+        flow_bends,
+    output:
+        posterior_spread,
+        posterior_spread_sidecar,
+    shell:
+        py_command(
+            "postprocessing.posterior_spread",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--calibration-dir {quoted(calibration_dir)} "
+            f"--flow-bends {quoted(flow_bends)}",
+        )
+
+
+rule filtered_gl_points_figure:
+    input:
+        points,
+        cumulative_intervals,
+        flow_bends,
+        reference_gl,
+        dinsars_dir,
+        radar_mosaic,
+    output:
+        filtered_map_pdf,
+        filtered_map_png,
+    shell:
+        py_command(
+            "visualizations.gl_points_map",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--figures-dir {quoted(figures_dir)} "
+            f"--flow-bends {quoted(flow_bends)} "
+            f"--reference-gl {quoted(reference_gl)} "
+            f"--dinsars-dir {quoted(dinsars_dir)} "
+            f"--radar-mosaic {quoted(radar_mosaic)}",
+        )
+
+
+rule ci_spatial_figures:
+    input:
+        pair_intervals,
+        flow_bends,
+    output:
+        ci_maps_pdf,
+        ci_maps_png,
+        ci_band_pdf,
+        ci_band_png,
+    shell:
+        py_command(
+            "visualizations.ci_spatial",
+            f"--flowlines {quoted(flow_bends)} "
+            f"--pair-intervals {quoted(pair_intervals)} "
+            f"--maps-out {quoted(ci_maps_pdf)} "
+            f"--band-out {quoted(ci_band_pdf)}",
+        )
+
+
+rule ci_widths_figure:
+    input:
+        points,
+        pair_intervals,
+    output:
+        ci_widths_pdf,
+        ci_widths_png,
+    shell:
+        py_command(
+            "visualizations.ci_widths_regplots",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--figures-dir {quoted(figures_dir)}",
+        )
+
+
+rule dinsar_violin_figure:
+    input:
+        distances,
+    output:
+        dinsar_violin_pdf,
+        dinsar_violin_png,
+    shell:
+        py_command(
+            "visualizations.violin_dinsar_comp",
+            f"--postprocessing-dir {quoted(postprocessing_dir)} "
+            f"--figures-dir {quoted(figures_dir)}",
+        )
+
+
+rule posterior_sum_figure:
+    input:
+        inversions_dir,
+    output:
+        posterior_sum_pdf,
+        posterior_sum_png,
+    shell:
+        py_command(
+            "visualizations.posteriors_sum",
+            f"--inversions-dir {quoted(inversions_dir)} "
+            f"--out {quoted(posterior_sum_pdf)}",
+        )

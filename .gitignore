@@ -1,0 +1,8 @@
+*/results/*
+*/__pycache__/*
+gl_migration_env/*
+config_*.yaml
+.snakemake
+.vscode
+slurm.cmd
+__pycache__

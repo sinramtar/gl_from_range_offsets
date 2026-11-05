@@ -1,0 +1,37 @@
+name: icesat
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - cartopy
+  - cmcrameri
+  - dask
+  - geopandas
+  - joblib
+  - matplotlib
+  - netcdf4
+  - numba
+  - numpy
+  - pandas
+  - plantcv
+  - pyarrow
+  - pyogrio
+  - pyproj
+  - pytest
+  - pytmd>=3
+  - python-dateutil
+  - pyyaml
+  - rasterio
+  - requests
+  - scikit-image
+  - scipy
+  - seaborn
+  - shapely>=2
+  - snakemake
+  - tqdm
+  - xarray
+  - zstandard
+  - pip
+  - pip:
+      - -e .
+      - matplotlib-map-utils

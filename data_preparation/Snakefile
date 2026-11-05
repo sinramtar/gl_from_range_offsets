@@ -1,0 +1,390 @@
+import pathlib
+from datetime import datetime
+
+import numpy as np
+from tqdm import tqdm
+
+import geopandas as gpd
+import pandas as pd
+import rasterio as rio
+from shapely import line_interpolate_point
+
+import flowlines as fl
+import incidence_angles as ia
+import modelled_tides as mt
+import range_offsets as ro
+import tmoc_gl as tgl
+
+from skimage.filters import gaussian
+
+repo_root = pathlib.Path(workflow.basedir).parent
+configfile: str(repo_root / 'config.yaml')
+
+directories = config['Directories']
+work_dir = pathlib.Path(directories['work_dir']).expanduser().resolve()
+workdir: str(work_dir)
+
+data_root = work_dir / directories['data_dir']
+roi_name = config['Offset_params']['roi']
+roi_dir = data_root / roi_name
+year = config['Offset_params']['year']
+baseline = config['Offset_params']['temporal_baseline']
+range_pixel_spacing = config['Offset_params']['range_pixel_spacing']
+roi = gpd.read_file(repo_root / 'rois' / f'{roi_name}.geojson').to_crs('EPSG:3031')
+
+
+def roi_path(name):
+    return str(roi_dir / name)
+
+
+def work_path(entry):
+    return work_dir / entry
+
+
+offsets = list((roi_dir / f'{year}').glob('*.slfmap.tif'))
+if len(offsets) == 0:
+    offsets = list((roi_dir / f'{year}').glob('*.slfmap_clip.tif'))
+
+valid_times = []
+valid_offsets = []
+for raster in offsets:
+    time = ro.get_sar_acquisition_times(raster.name)
+    if np.abs(time[0] - time[1]).days == baseline:
+        valid_times.append(time)
+        valid_offsets.append(raster)
+
+valid_times = np.array(valid_times)
+sort_time = np.argsort(valid_times[:, 0])
+valid_times = valid_times[sort_time]
+valid_offsets = np.array(valid_offsets)[sort_time]
+
+accurate_times = mt.get_accurate_acquisition_time(times = np.unique(valid_times.ravel()), roi = roi)
+accurate_times_str = [datetime.strftime(time, '%Y%m%d%H%M%S') for time in accurate_times]
+
+# Every raster written here is on the range-offsets grid, clipped to the ROI window.
+with rio.open(valid_offsets[0]) as tif:
+    offsets_meta = tif.meta.copy()
+    window = rio.windows.from_bounds(left = roi.total_bounds[0], right = roi.total_bounds[2], bottom = roi.total_bounds[1], top = roi.total_bounds[3],
+                                    transform = tif.transform)
+    window_bounds = rio.windows.bounds(window = window, transform = tif.transform)
+    window_transform = rio.windows.transform(window = window, transform = tif.transform)
+    window_shape = (int(round(window.height)), int(round(window.width)))
+    longs, lats = mt.get_window_coords(window = window, bounds = window_bounds, res = tif.res)
+
+slc_dir = work_path(directories['slc'])
+slc_scenes = sorted(path.name.removesuffix('.SAFE.zip') for path in slc_dir.glob('*.SAFE.zip'))
+
+incidence_angles = roi_path('merged_incidence_angles.tif')
+detrended = lambda y: roi_path(f'detrended_range_offsets_{y}.tif')
+data_error_raster = roi_path(config['Data_error']['raster'])
+correlation_coeffs = roi_path(config['Data_error']['correlation_coeffs'])
+error_sample_path = str(work_path(config['Data_error']['path']))
+
+rule all:
+    input:
+        detrended(year),
+        expand(roi_path(f'corrected_tides_{year}/{{time}}.tif'), time = accurate_times_str),
+        roi_path(f'differential_tides_{year}.tif'),
+        roi_path(f'correlation_{year}.tif'),
+        roi_path(f'tmoc_gl_{year}.geojson'),
+        roi_path('hybrid_flowlines.gpkg'),
+        roi_path('hybrid_grad_field.tif'),
+        roi_path(f'ref_gl_points_{year}.geojson'),
+        error_sample_path,
+        roi_path('tidal_range.tif')
+
+rule scene_incidence_angle:
+    input:
+        str(slc_dir / '{scene}.SAFE.zip')
+    output:
+        roi_path('incidence_angles/{scene}.tif')
+    run:
+        pathlib.Path(output[0]).parent.mkdir(parents = True, exist_ok = True)
+        grid = {'transform': window_transform, 'height': window_shape[0], 'width': window_shape[1]}
+        ia.scene_incidence_angle(slc_path = input[0], grid = grid, output = output[0])
+
+rule merge_incidence_angles:
+    input:
+        expand(roi_path('incidence_angles/{scene}.tif'), scene = slc_scenes)
+    output:
+        incidence_angles
+    run:
+        ia.merge_incidence_angles(scene_rasters = input, output = output[0])
+
+rule detrend_range_offsets:
+    input:
+        incidence_angles
+    output:
+        detrended(year)
+    run:
+        offsets_time_series, acq_times = ro.detrend_offsets(offsets = valid_offsets, bounds = roi.total_bounds,
+                                                            temporal_baseline = baseline,
+                                                            range_pixel_spacing = range_pixel_spacing)
+        offsets_time_series = ro.get_vertical_component_from_offsets(offsets_ts = offsets_time_series, incidence_angles_raster = input[0], bounds = roi.total_bounds)
+        meta = offsets_meta.copy()
+        meta.update({'count': offsets_time_series.shape[0], 'height': offsets_time_series.shape[1], 'width': offsets_time_series.shape[2], 'nodata': np.nan,
+                    'transform': window_transform})
+
+        with rio.open(output[0], 'w', **meta) as dest:
+            for band in range(offsets_time_series.shape[0]):
+                dest.write_band(band + 1, offsets_time_series[band, :, :])
+                str_times = datetime.strftime(acq_times[band, 0], '%Y%m%d') + '_' + datetime.strftime(acq_times[band, 1], '%Y%m%d')
+                dest.set_band_description(band + 1, str_times)
+
+rule compute_data_error:
+    input:
+        detrended = [detrended(y) for y in (2019, 2020, 2021)],
+        velocity_mag = str(work_path(directories['velocity_mag'])),
+        correlations = correlation_coeffs
+    output:
+        data_error_raster
+    run:
+        ro.get_data_error(velocity_mag = input.velocity_mag, detrended_offsets = input.detrended,
+                          correlations_tif = input.correlations, output = output[0])
+
+rule error_sample:
+    input:
+        data_error = data_error_raster,
+        correlations = correlation_coeffs
+    output:
+        error_sample_path
+    run:
+        pathlib.Path(output[0]).parent.mkdir(parents = True, exist_ok = True)
+        sample = ro.error_sample(data_error_tif = input.data_error, correlations_tif = input.correlations,
+                                 correlation_threshold = float(config['Data_error']['correlation_threshold']),
+                                 output = output[0])
+        print(f'error sample: {len(sample)} values, mean {sample.error.mean():.4f} m')
+
+rule get_tides:
+    output:
+        roi_path(f'corrected_tides_{year}/{{time}}.tif')
+    run:
+        output_path = pathlib.Path(output[0])
+        time = datetime.strptime(output_path.name.removesuffix('.tif'), '%Y%m%d%H%M%S')
+        tides = mt.get_corrected_tide(epoch = time, lats = lats, longs = longs, cats = data_root, ap_model = data_root / directories['airpressure'], standard = 'datetime')
+        meta = offsets_meta.copy()
+        meta.update({'count': 1, 'height': tides.shape[0], 'width': tides.shape[1], 'transform': window_transform})
+
+        with rio.open(output_path, 'w', **meta) as dest:
+            dest.write_band(1, tides)
+
+rule compute_differential_tides:
+    input:
+        expand(roi_path(f'corrected_tides_{year}/{{time}}.tif'), time = accurate_times_str)
+    output:
+        roi_path(f'differential_tides_{year}.tif')
+    run:
+        diff_tides_series = mt.get_differential_tides_time_series(acq_times = valid_times, tidesdir = roi_dir / f'corrected_tides_{year}')
+        print(f'Num diff tides: {diff_tides_series.shape[0]}')
+        meta = offsets_meta.copy()
+        meta.update({'count': diff_tides_series.shape[0], 'height': diff_tides_series.shape[1], 'width': diff_tides_series.shape[2], 'transform': window_transform})
+        with rio.open(output[0], 'w', **meta) as dest:
+            for band in range(diff_tides_series.shape[0]):
+                dest.write_band(band + 1, diff_tides_series[band, :, :])
+                str_times = datetime.strftime(valid_times[band, 0], '%Y%m%d') + '_' + datetime.strftime(valid_times[band, 1], '%Y%m%d')
+                dest.set_band_description(band + 1, str_times)
+
+rule correlate_tides:
+    input:
+        tides = expand(roi_path(f'corrected_tides_{year}/{{time}}.tif'), time = accurate_times_str),
+        incidence_angles = incidence_angles
+    output:
+        correlation = roi_path(f'correlation_{year}.tif')
+    run:
+        offsets_6_days, times_6_days = ro.detrend_offsets(offsets = offsets, bounds = roi.total_bounds, temporal_baseline = 6,
+                                                          range_pixel_spacing = range_pixel_spacing)
+        offsets_6_days = ro.get_vertical_component_from_offsets(offsets_ts = offsets_6_days, incidence_angles_raster = input.incidence_angles, bounds = roi.total_bounds)
+
+        offsets_12_days, times_12_days = ro.detrend_offsets(offsets = offsets, bounds = roi.total_bounds, temporal_baseline = 12,
+                                                            range_pixel_spacing = range_pixel_spacing)
+        offsets_12_days = ro.get_vertical_component_from_offsets(offsets_ts = offsets_12_days, incidence_angles_raster = input.incidence_angles, bounds = roi.total_bounds)
+
+        all_times = np.vstack([times_6_days, times_12_days])
+        all_offsets = np.concatenate([offsets_6_days, offsets_12_days], axis = 0)
+        sorted_times = np.argsort(all_times[:, 0])
+        all_times = all_times[sorted_times]
+        all_offsets = all_offsets[sorted_times]
+
+        # Both baselines enter the correlation; pairs without a tide raster are NaN.
+        diff_tides = mt.get_differential_tides_time_series(
+            acq_times = all_times,
+            tidesdir = roi_dir / f'corrected_tides_{year}',
+            shape = all_offsets.shape[1:])
+
+        # The CATS tides are nearest-neighbour samples of a ~4 km grid; smoothing removes
+        # the block edges before the rank correlation.
+        diff_tides = gaussian(diff_tides, sigma = 5, channel_axis = 0)
+        correlation, pvalue = tgl.spearman_per_pixel(a = all_offsets, b = diff_tides)
+        meta = offsets_meta.copy()
+        meta.update({'count': 2, 'nodata': np.nan, 'height': all_offsets.shape[1], 'width': all_offsets.shape[2], 'dtype': np.float32, 'transform': window_transform})
+        with rio.open(output[0], 'w', **meta) as dest:
+            dest.write_band(1, correlation)
+            dest.write_band(2, pvalue)
+
+rule get_average_gl:
+    input:
+        correlation = roi_path(f'correlation_{year}.tif')
+    output:
+        gl = roi_path(f'tmoc_gl_{year}.geojson')
+    run:
+        with rio.open(input.correlation) as tif:
+            correlation = tif.read(1)
+            pvalue = tif.read(2)
+
+        binary_correlation_array = tgl.get_tmoc_gl(correlation = correlation, pval = pvalue, threshold = config['Offset_params']['correlation_threshold'])
+        tmoc_gl = tgl.vectorize_gl(gl_arr = binary_correlation_array, transform = window_transform)
+        tmoc_gl = gpd.GeoDataFrame({'Id': np.arange(len(tmoc_gl))}, geometry = tmoc_gl, crs = 'EPSG:3031')
+        tmoc_gl.to_file(output.gl, driver = 'GeoJSON')
+
+rule tidal_range:
+    output:
+        roi_path('tidal_range.tif')
+    run:
+        tide_range, x, y = mt.get_tidal_range_grid(bounds = tuple(roi.total_bounds), cats = data_root)
+        spacing = x[1] - x[0], y[1] - y[0]
+        transform = rio.transform.from_origin(x[0] - spacing[0] / 2, y[0] - spacing[1] / 2, spacing[0], -spacing[1])
+        meta = {'driver': 'GTiff', 'count': 1, 'dtype': 'float32', 'crs': 'EPSG:3031', 'nodata': np.nan,
+                'height': tide_range.shape[0], 'width': tide_range.shape[1], 'transform': transform}
+        with rio.open(output[0], 'w', **meta) as dest:
+            dest.write_band(1, tide_range.astype(np.float32))
+        print(f'tidal range over {roi_name}: max {np.nanmax(tide_range):.2f} m')
+
+rule get_flowline_starting_points:
+    input:
+        roi_path(directories['original_tmoc_gl'])
+    output:
+        directory(roi_path('points')),
+        roi_path('points.OK')
+    run:
+        tmoc_gl = gpd.read_file(input[0])
+        if 'Id' not in tmoc_gl.columns:
+            tmoc_gl['Id'] = np.arange(len(tmoc_gl))
+        tmoc_gl = tmoc_gl.clip(roi)
+        pathlib.Path(output[0]).mkdir(parents = True, exist_ok = True)
+        index = 0
+        for ref_line_id, geom in tqdm(zip(tmoc_gl['Id'].values, tmoc_gl.geometry.values), total = len(tmoc_gl)):
+            for dist in np.arange(0, geom.length, config['Offset_params']['flowline_spacing']):
+                point = line_interpolate_point(geom, dist)
+                point_df = gpd.GeoDataFrame({'ref_line_id': [int(ref_line_id)]}, geometry = [point], crs = 'EPSG:3031')
+                point_df.to_file(output[0] + f'/{index}.geojson', driver = 'GeoJSON')
+                index = index + 1
+
+        with open(output[1], 'w') as out:
+            out.write('OK')
+
+def aggregate_points(wildcards):
+    return [str(point) for point in (roi_dir / 'points').glob('*.geojson')]
+
+
+def aggregate_flowlines(wildcards):
+    """One flow-bend line per starting point, named by the same id. The point ids exist
+    only after `get_flowline_starting_points` has run."""
+    return [roi_path(f'hybrid_flowlines/{point.name}') for point in (roi_dir / 'points').glob('*.geojson')]
+
+rule get_bending_flow_hybrid_field:
+    input:
+        roi_path('points.OK'),
+        offset_files = [detrended(y) for y in (2019, 2020, 2021)]
+    output:
+        roi_path('hybrid_grad_field.tif')
+    run:
+        offsets_stack = []
+        for f in input.offset_files:
+            with rio.open(f) as tif:
+                offsets_stack.append(tif.read())
+                meta = tif.meta.copy()
+                offset_bounds = tif.bounds
+        offsets_stack = np.concatenate(offsets_stack, axis = 0)
+        with rio.open(work_path(directories['velocity'])) as tif:
+            window = rio.windows.from_bounds(left = offset_bounds[0], right = offset_bounds[2],
+                                            bottom = offset_bounds[1], top = offset_bounds[3],
+                                            transform = tif.transform)
+            velocity = tif.read([1, 2], window = window, masked = True)
+
+        combined_velocity_bending_field, combined_u, combined_v = fl.combine_velocity_and_bending_fields(
+            velocity = velocity, offsets = offsets_stack,
+            lower_stddev_threshold = config['Flowline_params']['lower_stddev'],
+            upper_stddev_threshold = config['Flowline_params']['upper_stddev'],
+            sigma = config['Flowline_params']['sigma'])
+
+        meta.update({'count': 3, 'nodata': np.nan, 'dtype': np.float32})
+        descriptions = ['u', 'v', 'combined']
+
+        with rio.open(output[0], 'w', **meta) as dest:
+            for band, data in enumerate([combined_u, combined_v, combined_velocity_bending_field]):
+                dest.write_band(band + 1, data)
+                dest.set_band_description(band + 1, descriptions[band])
+
+rule get_flowlines:
+    input:
+        roi_path('points/{id}.geojson'),
+        roi_path('points.OK'),
+        roi_path('hybrid_grad_field.tif')
+    output:
+        roi_path('hybrid_flowlines/{id}.geojson')
+    run:
+        with rio.open(input[2]) as tif:
+            field = tif.read([1, 2])
+            transform = tif.transform
+
+        flowline = fl.get_flowline(start = gpd.read_file(input[0]), ice_velocity = field, transform = transform,
+                                 lengths = [config['Flowline_params']['landward'], config['Flowline_params']['seaward']],
+                                 step = config['Flowline_params']['step'],
+                                 integration_step = config['Flowline_params']['integration_step'],
+                                 progress_window_steps = config['Flowline_params']['progress_window_steps'],
+                                 min_progress_fraction = config['Flowline_params']['min_progress_fraction'])
+        df = gpd.GeoDataFrame(geometry = [flowline], crs = 'EPSG:3031')
+        df.to_file(output[0])
+
+rule merge_points:
+    input:
+        confirmation = roi_path('points.OK'),
+        points = aggregate_points
+    output:
+        roi_path(f'ref_gl_points_{year}.geojson'),
+        roi_path('merged_points.OK')
+    run:
+        ids = []
+        points = []
+        for point_file in input.points:
+            points.append(gpd.read_file(point_file))
+            ids.append(int(pathlib.Path(point_file).name.removesuffix('.geojson')))
+        intersecting_points = pd.concat(points, axis = 0)
+        intersecting_points['Id'] = ids
+        intersecting_points[['Id', 'geometry']].to_file(output[0], driver = 'GeoJSON')
+
+        with open(output[1], 'w') as out:
+            out.write('OK')
+
+rule merge_flowlines:
+    input:
+        confirmation = roi_path('merged_points.OK'),
+        flowlines = aggregate_flowlines
+    output:
+        roi_path('hybrid_flowlines.gpkg')
+    run:
+        flowlines = []
+        ids = []
+        ref_line_ids = []
+        for df in input.flowlines:
+            df = pathlib.Path(df)
+            flowlines.append(gpd.read_file(df))
+            ids.append(int(df.name.removesuffix('.geojson')))
+            ref_line_ids.append(int(gpd.read_file(roi_dir / 'points' / df.name)['ref_line_id'].iloc[0]))
+
+        flowlines_df = pd.concat(flowlines)
+        flowlines_df['Id'] = ids
+        flowlines_df['ref_line_id'] = ref_line_ids
+        max_reversal_fraction = config['Flowline_params']['max_reversal_fraction']
+        valid = flowlines_df.geometry.apply(
+            fl.flowline_passes_reversal_check,
+            max_reversal_fraction = max_reversal_fraction,
+        )
+        rejected = flowlines_df.loc[~valid, 'Id'].astype(int).tolist()
+        if rejected:
+            print(
+                f'Rejected {len(rejected)} flow-bend lines with reversal fraction '
+                f'above {max_reversal_fraction}: {rejected}'
+            )
+        flowlines_df = flowlines_df.loc[valid, ['Id', 'ref_line_id', 'geometry']].copy()
+        flowlines_df.to_file(output[0], driver = 'GPKG')
