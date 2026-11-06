@@ -33,7 +33,7 @@ from gl_from_range_offsets.visualizations import style
 THRESHOLDS = np.round(np.arange(0.0, 1.0, 0.1), 1)
 STABLE_SPEED = 0.01  # m/day
 N_BINS = 10
-GRID = np.linspace(0.1, 1.0, 400)
+GRID = np.linspace(0.0, 1.0, 500)
 FONTSIZE = 11
 
 
@@ -95,9 +95,9 @@ def plot(table, out, reference_means=None):
     cmap = mpl.colormaps["copper_r"]
     colors = {t: cmap(0.15 + 0.75 * i / max(1, len(thresholds) - 1))
               for i, t in enumerate(thresholds)}
-    step, height = 1.0, 2.6
+    step, height = 1.0, 1.6
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.0), layout="constrained")
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), layout="constrained")
     for row, t in enumerate(reversed(thresholds)):
         d = table[table["threshold"] == t]
         base = row * step
@@ -116,12 +116,10 @@ def plot(table, out, reference_means=None):
             ax.plot([ref, ref], [base, base + np.interp(ref, GRID, density)], color="0.1",
                     linewidth=1.0, linestyle=(0, (2, 2)),
                     zorder=2 * (len(thresholds) - row) + 1)
-        ax.text(0.105, base + 0.15, rf"$\rho \geq {t:.1f}$", ha="left", va="bottom",
-                fontsize=FONTSIZE, color="0.1", zorder=100)
-        label = rf"$E[\sigma] = {mean:.3f}$"
+        label = rf"$\rho \geq {t:.1f}$:  $E[\sigma] = {mean:.3f}$"
         if reference_means is not None and t in reference_means:
             label += rf" (was ${reference_means[t]:.3f}$)"
-        ax.text(0.995, base + 0.15, label, ha="right", va="bottom", fontsize=FONTSIZE - 1,
+        ax.text(0.995, base + 0.12, label, ha="right", va="bottom", fontsize=FONTSIZE - 1,
                 color="0.1", zorder=100)
 
     ax.set_xlim(GRID[0], GRID[-1])

@@ -24,7 +24,7 @@ def fill_error_std(errors: np.ndarray,
     The correlation range [0, 1] is split into `n_bins` equal bins, closed on the right
     ((0, 0.1], ..., (0.9, 1.0] for ten bins); values at or below 0 fall in the first bin
     and values above 1 in the last. Pixels with a non-finite correlation, or outside
-    `valids_mask`, stay NaN.
+    `valids_mask`, stay NaN, as do bins with fewer than two stable pixels.
 
     Parameters
     ----------
@@ -52,7 +52,7 @@ def fill_error_std(errors: np.ndarray,
     bin_stds = np.full(n_bins, np.nan, dtype=float)
     for b in range(n_bins):
         in_bin = stable & (bins == b)
-        if np.any(in_bin):
+        if np.count_nonzero(in_bin) >= 2:
             bin_stds[b] = np.nanstd(errors[in_bin], ddof=0)
             filled[assignable & (bins == b)] = bin_stds[b]
     return filled, bin_stds
